@@ -501,6 +501,238 @@ Step 8 (800+/day): NVIDIA NIM → self-hosted GLM-4.7-flash
 
 ---
 
+## Core package — `packages/core`
+
+Zero infrastructure dependencies. Pure Python + numpy + pydantic only.
+No imports from `apps/`, `packages/ml/`, or `packages/storage/`.
+Workers import from core — never the other way around.
+This means every function here is unit-testable with no mocks, no DB, no API keys.
+
+---
+
+### `density/signals.py` — 5 signal extractors
+
+These are the raw inputs to the density scorer. Each returns a float 0–1.
+
+#### `compute_silence_ratio(audio_features)`
+```
+silence_duration = sum of (scene_duration × scene_silence_ratio) for each scene
+output = silence_duration / total_duration
+```
+Source: librosa per-scene `silence_ratio` field (fraction of frames with rms < 0.01).
+High value → lots of dead air → safe to compress more.
+
+#### `compute_filler_word_rate(transcript_text)`
+```
+filler words = {um, uh, like, you know, basically, literally, actually, so}
+rate = (filler_count / total_words) × 100
+output = clip(rate / 20.0, 0, 1)    # 20 fillers/100 words = 1.0
+```
+Source: Groq transcript text. High value → casual, padded speech → compress more.
+
+#### `compute_pacing_variance(audio_features)`
+```
+wpms = [scene.speech_rate_wpm for scene if wpm > 0]
+output = clip(std(wpms) / 100.0, 0, 1)    # 100 WPM std = 1.0
+```
+Source: WPM filled by segment worker using Groq word timestamps.
+High variance → dynamic pacing → likely denser content.
+
+#### `compute_lexical_density(transcript_text)`
+```
+output = unique_words / total_words    # type-token ratio
+```
+Source: Groq transcript. Higher = richer vocabulary = denser content.
+A lecture on ML: ~0.55. Casual podcast: ~0.35.
+
+#### `normalize_topic_count(topic_count, video_duration_s)`
+```
+topics_per_minute = topic_count / (duration / 60)
+output = clip(topics_per_minute / 1.0, 0, 1)    # 1 topic/min = 1.0
+```
+Source: TextTiling segment count. More topics per minute = denser content.
+
+---
+
+### `density/scorer.py` — `compute_density_score(signals)`
+
+Pure function. Takes all 7 signals, returns `DensityResult`.
+
+```python
+compressibility = 0.30 × semantic_redundancy   # pulls score DOWN (safe to cut)
+               + 0.20 × silence_ratio
+               + 0.15 × filler_word_rate
+
+density        = 0.20 × lexical_density        # pulls score UP (cut less)
+               + 0.10 × normalize(topic_count)
+               + 0.05 × visual_change_rate
+
+score = clip(density - compressibility + 0.5, 0.0, 1.0)
+```
+
+**Why 0.5 offset:** Centers the scale. If all signals are average (0.5), score = 0.5 → 3–4× recommendation. Without offset, average content would score near 0 and always get max compression.
+
+**Ratio recommendation:**
+```
+score ≥ 0.80 → None  (do not compress — content too dense)
+score ≥ 0.60 → 2×   (±1)
+score ≥ 0.40 → 3×   (±1, center of 3–4× band)
+score ≥ 0.20 → 6×   (±2, center of 5–7× band)
+score <  0.20 → 9×  (±2, center of 8–10× band)
+```
+
+The confidence interval (±1 or ±2) tells the UI what range is safe to offer the user.
+
+---
+
+### `segmentation/texttiling.py`
+
+#### `align_transcript_to_scenes(transcript_segments, scenes)`
+Prereq step before TextTiling can run. Merges Groq word-level transcript into
+one text chunk per PySceneDetect scene. Each chunk = all words spoken during that scene.
+Returns `[{"text": str, "start_s": float, "end_s": float}, ...]`.
+
+#### `find_boundaries(chunks, threshold=0.35)`
+```
+1. embed each chunk → 384-dim vector (all-MiniLM-L6-v2, already normalized)
+2. for each adjacent pair: sim = dot(emb[i-1], emb[i])
+3. sim < threshold → topic boundary → start new segment
+4. merge any segment shorter than TEXTTILING_MIN_SEGMENT_SECONDS (default 60s)
+   into its neighbor to avoid tiny fragments
+5. re-index and return segments with timestamps
+```
+
+**Threshold tuning:**
+- 0.35 → structured content (lectures, demos, tutorials)
+- 0.25 → casual content (interviews, podcasts) — more sensitive
+- Too many tiny segments → raise threshold
+- Missing obvious topic shifts → lower threshold
+
+#### `segmentation/labels.py` — `maybe_label_segments(segments)`
+Calls `label_all_segments()` in nvidianim.py if `SEGMENT_LABELING_ENABLED=true`.
+Each segment gets a 3–5 word human-readable label ("Introduction", "Live Demo", "Q&A").
+Falls back to "Segment 1/2/3" if disabled or API fails.
+
+---
+
+### `selection/light.py` — 2–3× rule-based
+
+No LLM. ~1s to run. Zero API cost.
+
+```
+For each scene:
+  if silence_ratio > 0.85 → drop (pure silence)
+  else → keep
+
+Deduplicate: cosine sim > 0.92 with any kept scene → drop (near-identical content)
+
+Trim to target: walk kept scenes in order, stop when target duration reached
+```
+
+Quality target: ≥ 92% of meaningful content retained. Designed for talks where
+the content is good but padded with dead air and verbal filler.
+
+---
+
+### `selection/moderate.py` — 4–6× submodular greedy
+
+```
+composite_score = 0.45 × llm_score       (normalized 0–1)
+               + 0.30 × audio_emphasis   (rms_energy + pitch_variance) / 2
+               + 0.25 × visual_salience  (MoViNet frame-to-frame L2, normalized)
+
+sort all scenes by composite_score descending
+
+for each scene:
+  if selected_duration + scene_duration > target × 1.05 → skip
+  if max cosine_sim(scene, any selected scene) > 0.82 → skip  (diversity)
+  else → select
+
+return selected in chronological order
+```
+
+**Why the diversity check matters:** Without it, the top 10 scenes by score are
+often from the same 2-minute "peak" window. The diversity threshold forces the
+selector to spread across the whole video.
+
+**Why 0.82 not 0.92:** More aggressive than light trim. At 4–6× you're making
+real editorial cuts — near-similar content (0.82 sim) is redundant enough to drop.
+
+---
+
+### `selection/highlight.py` — 7–10× topic-cluster representative
+
+```
+K = ceil(topic_count × (1 - (ratio - 7) / 10))
+
+examples:
+  5 topics at 7×  → K = ceil(5 × 1.0)  = 5  (keep all topics)
+  5 topics at 8×  → K = ceil(5 × 0.9)  = 5
+  5 topics at 9×  → K = ceil(5 × 0.8)  = 4
+  5 topics at 10× → K = ceil(5 × 0.7)  = 4
+
+for each TextTiling segment:
+  segment_score = sum of composite scores of all scenes inside it
+
+rank segments by segment_score descending, take top K
+
+for each of the K segments:
+  best_scene = scene with highest composite_score inside this segment
+
+return K scenes in chronological order
+```
+
+**Why topic-cluster at 7–10×:** Greedy composite scoring at extreme compression
+always collapses to the top 2 minutes. TextTiling forces one scene per topic
+cluster — guarantees the output covers the full video arc even at 10×.
+
+---
+
+### `scoring/composite.py` — `build_composite_scores(scenes, llm_scores, audio_features, movinet_features)`
+
+Assembles the final per-scene composite score from three lanes:
+
+```python
+llm_s          = llm_scores[scene_index]["llm_score"] / 10.0   # normalize to 0-1
+
+audio_emphasis = clip((rms_energy + pitch_variance) / 2, 0, 1)  # from librosa
+
+visual_salience:
+  if movinet_features available:
+    diffs = L2 distance between consecutive frame embeddings
+    visual_salience = mean(diffs[start_frame:end_frame]), normalized by max
+  else:
+    visual_salience = 0.5  # neutral fallback
+
+composite = 0.45 × llm_s + 0.30 × audio_emphasis + 0.25 × visual_salience
+```
+
+Output stored as `scores_{ratio}.json`. Used by both moderate and highlight selectors.
+
+---
+
+### `models.py` — shared Pydantic types
+
+| Type | Used by |
+|------|---------|
+| `DensitySignals` | Input to `compute_density_score` (7 fields) |
+| `DensityResult` | Output: score, ratio, CI, signals dict, message |
+| `Word` | Groq word with start/end timestamps |
+| `TranscriptSegment` | One Whisper segment with words list |
+| `Transcript` | Full transcript: language + segments |
+| `Scene` | PySceneDetect boundary: scene_index, start_s, end_s, duration_s |
+| `TopicSegment` | TextTiling output: timestamps + chunk_indices + label |
+| `SegmentScore` | Composite score: llm_score, audio_emphasis, visual_salience, composite_score, reason |
+| `SelectionSegment` | Selector output: start_s, end_s, scene_index, topic_segment_index |
+| `AudioFeatures` | librosa per-scene: rms_energy, pitch_variance, speech_rate_wpm, silence_ratio |
+| `JobStatus` | Enum: pending/analyzing/awaiting_ratio/summarizing/done/failed |
+| `VideoType` | Enum: lecture/interview/demo/podcast/tutorial/short_film/movie/episode/unknown |
+| `Ratioband` | Enum: light/moderate/highlight |
+| `JobCreate`, `JobResponse` | API request/response shapes |
+| `ConfirmRatioRequest`, `ResummarizeRequest`, `FeedbackRequest` | API body types |
+
+---
+
 ## Competitive moat
 
 Every existing tool (NoteGPT, Eightify, Vimeo AI, Otter.ai) outputs **text**.
