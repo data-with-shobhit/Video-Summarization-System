@@ -12,6 +12,26 @@ the output using the best selection strategy for that compression band.
 
 ---
 
+## Example outputs
+
+### Sam Altman × Nikhil Kamath — podcast interview
+
+| | Link |
+|--|------|
+| Original | [YouTube](https://www.youtube.com/watch?v=SfOaZIGJ_gs) |
+| Compressed | [Google Drive](https://drive.google.com/file/d/1AT5nb-7XKq69_Am6ccjLvQ5rzLzzbl9t/view?usp=sharing) |
+
+---
+
+### Marques Brownlee — Pixel 9 review
+
+| | Link |
+|--|------|
+| Original | [YouTube](https://www.youtube.com/watch?v=EGkGRs6YhoM) |
+| Compressed | [Google Drive](https://drive.google.com/file/d/1swzh5upX9DLwIeYQIrvEIuWnYPKn_k7r/view?usp=drive_link) |
+
+---
+
 ## Pipeline overview
 
 ```
